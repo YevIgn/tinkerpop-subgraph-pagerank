@@ -1,11 +1,12 @@
+
 package test.tinkerpop.subgraph.pagerank;
 
+import org.apache.tinkerpop.gremlin.process.computer.Computer;
+import org.apache.tinkerpop.gremlin.process.computer.GraphComputer;
 import org.apache.tinkerpop.gremlin.process.traversal.Order;
 import org.apache.tinkerpop.gremlin.process.traversal.P;
-import org.apache.tinkerpop.gremlin.process.traversal.TraversalStrategy;
 import org.apache.tinkerpop.gremlin.process.traversal.dsl.graph.GraphTraversalSource;
 import org.apache.tinkerpop.gremlin.process.traversal.dsl.graph.__;
-import org.apache.tinkerpop.gremlin.process.traversal.strategy.decoration.SubgraphStrategy;
 import org.apache.tinkerpop.gremlin.structure.Edge;
 import org.apache.tinkerpop.gremlin.structure.Graph;
 import org.apache.tinkerpop.gremlin.structure.T;
@@ -16,9 +17,9 @@ import org.apache.tinkerpop.gremlin.tinkergraph.structure.TinkerGraph;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.Collection;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 @SuppressWarnings("unchecked")
 public class Main {
@@ -34,18 +35,33 @@ public class Main {
             loadGraph(graph);
 
             Map<String, Collection> subGraphMap = getSubgraph(g);
+            Map<String, Collection> idsOnlySubgraphMap = getSubgraphIdsOnly(g);
 
             pageRankForInMemorySubGraph(subGraphMap);
-            pageRankForOLAPWithFilter(subGraphMap, g);
+            pageRankForOLAPWithFilter(subGraphMap, graph);
+            pageRankForOLAPWithFilterIdsOnly(idsOnlySubgraphMap, graph);
         }
     }
 
-    private static void pageRankForOLAPWithFilter(Map<String, Collection> subGraphMap, GraphTraversalSource g) {
-        TraversalStrategy strategy = SubgraphStrategy.build()
-                .vertices(__.is(P.within(subGraphMap.get(VERTICES))))
-                .create();
+    private static void pageRankForOLAPWithFilter(Map<String, Collection> subGraphMap, Graph graph) {
+        final List<String> vids = (List<String>) subGraphMap.get(VERTICES).stream()
+                .map(v -> ((Vertex) v).id()).collect(Collectors.toList());
+        final List<String> eids = (List<String>) subGraphMap.get(EDGES).stream()
+                .map(e -> ((Edge) e).id()).collect(Collectors.toList());
+        final Computer computer = Computer.compute()
+                .vertices(__.hasId(P.within(vids)))
+                .edges(__.bothE().hasId(P.within(eids)))
+                .result(GraphComputer.ResultGraph.ORIGINAL);
+        final GraphTraversalSource g = graph.traversal().withComputer(computer);
+        printTopRanked(g);
+    }
 
-        g = g.withStrategies(strategy);
+    private static void pageRankForOLAPWithFilterIdsOnly(Map<String, Collection> subGraphIdsMap, Graph graph) {
+        final Computer computer = Computer.compute()
+                .vertices(__.hasId(P.within(subGraphIdsMap.get(VERTICES))))
+                .edges(__.bothE().hasId(P.within(subGraphIdsMap.get(EDGES))))
+                .result(GraphComputer.ResultGraph.ORIGINAL);
+        final GraphTraversalSource g = graph.traversal().withComputer(computer);
         printTopRanked(g);
     }
 
@@ -76,12 +92,8 @@ public class Main {
                     .distinct()
                     .forEach(obj -> {
                         Edge edge = (Edge) obj;
-                        Iterator<Vertex> outIn = inMemoryGraph.vertices(
-                                edge.outVertex().id(),
-                                edge.inVertex().id()
-                        );
-                        Edge inMemoryEdge = outIn.next()
-                                .addEdge(edge.label(), outIn.next());
+                        Edge inMemoryEdge = inMemoryG.V(edge.outVertex().id())
+                                .addE(edge.label()).to(__.V().hasId(edge.inVertex().id())).next();
 
                         edge.properties()
                                 .forEachRemaining(
@@ -89,21 +101,23 @@ public class Main {
                     });
 
             // Page rank.
-            printTopRanked(inMemoryG);
+            printTopRanked(inMemoryG.withComputer());
         }
     }
 
     private static void printTopRanked(GraphTraversalSource g) {
-        List results = g
-                .withComputer()
+        g
                 .V()
                 .pageRank()
                 .by(__.bothE())
                 .by(PAGE_RANK)
+                .times(1)
                 .order().by(PAGE_RANK, Order.decr)
+                .limit(20)
                 .valueMap(NUMBER, PAGE_RANK)
-                .next(20);
-        System.out.println(results);
+                .forEachRemaining(System.out::println);
+        System.out.println("V: " + g.V().count().next());
+        System.out.println("E: " + g.E().count().next());
     }
 
     private static Map<String, Collection> getSubgraph(GraphTraversalSource g) {
@@ -122,6 +136,26 @@ public class Main {
                 .where(P.within(VERTICES))
                 .select(EDGE)
                 .store(EDGES)
+                .cap(VERTICES, EDGES)
+                .next();
+    }
+
+    private static Map<String, Collection> getSubgraphIdsOnly(GraphTraversalSource g) {
+        return (Map) g
+                .V()
+                .has(NUMBER, 204984)
+                .emit()
+                .repeat(__.bothE().dedup().store(EDGES).by(T.id).otherV())
+                .times(2)
+                .dedup()
+                .aggregate(VERTICES).by(T.id)
+                .bothE()
+                .where(P.without(EDGES))
+                .as(EDGE)
+                .otherV()
+                .where(__.hasId(P.within(VERTICES)))
+                .select(EDGE)
+                .store(EDGES).by(T.id)
                 .cap(VERTICES, EDGES)
                 .next();
     }
