@@ -7,105 +7,91 @@ import org.apache.tinkerpop.gremlin.process.traversal.Order;
 import org.apache.tinkerpop.gremlin.process.traversal.P;
 import org.apache.tinkerpop.gremlin.process.traversal.dsl.graph.GraphTraversalSource;
 import org.apache.tinkerpop.gremlin.process.traversal.dsl.graph.__;
-import org.apache.tinkerpop.gremlin.structure.Edge;
 import org.apache.tinkerpop.gremlin.structure.Graph;
 import org.apache.tinkerpop.gremlin.structure.T;
 import org.apache.tinkerpop.gremlin.structure.Vertex;
 import org.apache.tinkerpop.gremlin.structure.io.graphml.GraphMLReader;
 import org.apache.tinkerpop.gremlin.tinkergraph.structure.TinkerGraph;
+import org.janusgraph.core.JanusGraph;
+import org.janusgraph.core.JanusGraphFactory;
+import org.janusgraph.core.PropertyKey;
+import org.janusgraph.core.schema.JanusGraphManagement;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.Collection;
-import java.util.List;
+import java.util.HashMap;
 import java.util.Map;
-import java.util.stream.Collectors;
+import java.util.function.Supplier;
 
 @SuppressWarnings("unchecked")
 public class Main {
+    private static final Logger log = LoggerFactory.getLogger(Main.class);
+
     private static final String NUMBER = "number";
     private static final String VERTICES = "vertices";
     private static final String EDGES = "edges";
     private static final String EDGE = "edge";
     private static final String PAGE_RANK = "pageRank";
+    private static final Map<String, Supplier<Graph>> GRAPHS = new HashMap<String, Supplier<Graph>>() {{
+        put("TinkerGraph", Main::openTinkerGraph);
+        put("JanusGraph", Main::openJanusGraph);
+    }};
 
-    public static void main(String... args) throws Exception {
-        try (Graph graph = TinkerGraph.open();
+    private static Graph openTinkerGraph() {
+        return TinkerGraph.open();
+    }
+
+    private static Graph openJanusGraph() {
+        JanusGraph graph = JanusGraphFactory.open(Main.class.getResource("/janusgraph-berkeley.properties").getFile());
+
+        JanusGraphManagement management = graph.openManagement();
+
+        if (management.containsPropertyKey(NUMBER)) {
+            return graph;
+        }
+        PropertyKey key = management.makePropertyKey(NUMBER).dataType(Integer.class).make();
+        management.buildIndex("keyIndex", Vertex.class)
+                .addKey(key)
+                .buildCompositeIndex();
+        management.commit();
+        return graph;
+    }
+
+    public static void main(String... args) {
+        GRAPHS.forEach(Main::runPageRankForGraph);
+    }
+
+    private static void runPageRankForGraph(String name, Supplier<Graph> graphSupplier) {
+        log.info(String.format("Using: %s graph.", name));
+
+        try (Graph graph = graphSupplier.get();
              GraphTraversalSource g = graph.traversal()) {
             loadGraph(graph);
 
-            Map<String, Collection> subGraphMap = getSubgraph(g);
-            Map<String, Collection> idsOnlySubgraphMap = getSubgraphIdsOnly(g);
+            Map<String, Collection> idsOnlySubgraphMap = getSubgraphIds(g);
 
-            pageRankForInMemorySubGraph(subGraphMap);
-            pageRankForOLAPWithFilter(subGraphMap, graph);
-            pageRankForOLAPWithFilterIdsOnly(idsOnlySubgraphMap, graph);
+            calculatePageRankAndPrintTopRanked(idsOnlySubgraphMap, graph);
+            clearGraph(g);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
         }
     }
 
-    private static void pageRankForOLAPWithFilter(Map<String, Collection> subGraphMap, Graph graph) {
-        final List<String> vids = (List<String>) subGraphMap.get(VERTICES).stream()
-                .map(v -> ((Vertex) v).id()).collect(Collectors.toList());
-        final List<String> eids = (List<String>) subGraphMap.get(EDGES).stream()
-                .map(e -> ((Edge) e).id()).collect(Collectors.toList());
-        final Computer computer = Computer.compute()
-                .vertices(__.hasId(P.within(vids)))
-                .edges(__.bothE().hasId(P.within(eids)))
-                .result(GraphComputer.ResultGraph.ORIGINAL);
-        final GraphTraversalSource g = graph.traversal().withComputer(computer);
-        printTopRanked(g);
-    }
-
-    private static void pageRankForOLAPWithFilterIdsOnly(Map<String, Collection> subGraphIdsMap, Graph graph) {
-        final Computer computer = Computer.compute()
+    private static void calculatePageRankAndPrintTopRanked(Map<String, Collection> subGraphIdsMap, Graph graph) {
+        Computer computer = Computer.compute()
                 .vertices(__.hasId(P.within(subGraphIdsMap.get(VERTICES))))
                 .edges(__.bothE().hasId(P.within(subGraphIdsMap.get(EDGES))))
                 .result(GraphComputer.ResultGraph.ORIGINAL);
-        final GraphTraversalSource g = graph.traversal().withComputer(computer);
+        GraphTraversalSource g = graph.traversal().withComputer(computer);
         printTopRanked(g);
     }
 
-    private static void pageRankForInMemorySubGraph(Map<String, Collection> subGraphMap) throws Exception {
-        try (Graph inMemoryGraph = TinkerGraph.open()) {
-            GraphTraversalSource inMemoryG = inMemoryGraph
-                    .traversal();
-
-            // Load vertices.
-            subGraphMap.get(VERTICES)
-                    .stream()
-                    .distinct()
-                    .forEach(obj -> {
-                        Vertex vertex = (Vertex) obj;
-                        Vertex inMemoryVertex = inMemoryGraph.addVertex(
-                                T.id, vertex.id(),
-                                T.label, vertex.label()
-                        );
-
-                        vertex.properties()
-                                .forEachRemaining(
-                                        property -> inMemoryVertex.property(property.key(), property.value()));
-                    });
-
-            // Load edges.
-            subGraphMap.get(EDGES)
-                    .stream()
-                    .distinct()
-                    .forEach(obj -> {
-                        Edge edge = (Edge) obj;
-                        Edge inMemoryEdge = inMemoryG.V(edge.outVertex().id())
-                                .addE(edge.label()).to(__.V().hasId(edge.inVertex().id())).next();
-
-                        edge.properties()
-                                .forEachRemaining(
-                                        property -> inMemoryEdge.property(property.key(), property.value()));
-                    });
-
-            // Page rank.
-            printTopRanked(inMemoryG.withComputer());
-        }
-    }
-
     private static void printTopRanked(GraphTraversalSource g) {
+        StringBuilder result = new StringBuilder();
+
         g
                 .V()
                 .pageRank()
@@ -115,32 +101,13 @@ public class Main {
                 .order().by(PAGE_RANK, Order.decr)
                 .limit(20)
                 .valueMap(NUMBER, PAGE_RANK)
-                .forEachRemaining(System.out::println);
-        System.out.println("V: " + g.V().count().next());
-        System.out.println("E: " + g.E().count().next());
+                .forEachRemaining(kv -> result.append(kv.toString()).append("\n"));
+        result.append("V: ").append(g.V().count().next()).append("\n")
+                .append("E: ").append(g.E().count().next()).append("\n");
+        log.info(result.toString());
     }
 
-    private static Map<String, Collection> getSubgraph(GraphTraversalSource g) {
-        return (Map) g
-                .V()
-                .has(NUMBER, 204984)
-                .emit()
-                .repeat(__.bothE().dedup().store(EDGES).otherV())
-                .times(2)
-                .dedup()
-                .aggregate(VERTICES)
-                .bothE()
-                .where(P.without(EDGES))
-                .as(EDGE)
-                .otherV()
-                .where(P.within(VERTICES))
-                .select(EDGE)
-                .store(EDGES)
-                .cap(VERTICES, EDGES)
-                .next();
-    }
-
-    private static Map<String, Collection> getSubgraphIdsOnly(GraphTraversalSource g) {
+    private static Map<String, Collection> getSubgraphIds(GraphTraversalSource g) {
         return (Map) g
                 .V()
                 .has(NUMBER, 204984)
@@ -150,14 +117,22 @@ public class Main {
                 .dedup()
                 .aggregate(VERTICES).by(T.id)
                 .bothE()
-                .where(P.without(EDGES))
+                .where(P.without(EDGES)).by(T.id).by()
                 .as(EDGE)
                 .otherV()
-                .where(__.hasId(P.within(VERTICES)))
+                .where(P.within(VERTICES)).by(T.id).by()
                 .select(EDGE)
                 .store(EDGES).by(T.id)
                 .cap(VERTICES, EDGES)
                 .next();
+    }
+
+    private static void clearGraph(GraphTraversalSource g) {
+        g.E().drop().iterate();
+        g.V().drop().iterate();
+        if (g.getGraph().features().graph().supportsTransactions()) {
+            g.tx().commit();
+        }
     }
 
     private static void loadGraph(Graph graph) throws IOException {
